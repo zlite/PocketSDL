@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <ESPmDNS.h>
 #include <Wire.h>
 #include <math.h>
 #include <Preferences.h>
@@ -76,6 +77,7 @@ static bool saveStoredWiFiCreds(const String& ssid, const String& pass);
 static String readSerialLine(bool echoInput = true);
 static bool promptForWiFiCreds();
 static void connectWiFi();
+static void startMdns();
 static bool parseJsonFloat(const String& body, const char* key, float& valueOut);
 static String buildStatusJson();
 static String buildScoresJson();
@@ -302,13 +304,25 @@ static void connectWiFi(){
   int tries=0;
   while(WiFi.status()!=WL_CONNECTED&&tries++<40){delay(500);Serial.print(".");}
   if(WiFi.status()==WL_CONNECTED){
-    Serial.println("\nOpen: http://"+WiFi.localIP().toString());
-    setStateMessage("WiFi connected.");
+    startMdns();
     setLED(0,60,0);delay(1200);setLED(0,0,0);
   } else {
     Serial.println("\nWiFi failed");
     setStateMessage("WiFi connection failed. Reboot to re-enter credentials in Serial.");
     setLED(60,0,0);delay(2000);setLED(0,0,0);
+  }
+}
+
+static void startMdns(){
+  const char* hostName = "sdl";
+  if(MDNS.begin(hostName)){
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("\nOpen: http://" + String(hostName) + ".local or http://" + WiFi.localIP().toString());
+    setStateMessage("WiFi connected at http://sdl.local");
+  } else {
+    Serial.println("\nOpen: http://" + WiFi.localIP().toString());
+    Serial.println("WARN: mDNS failed to start; use the IP address instead.");
+    setStateMessage("WiFi connected (mDNS unavailable).");
   }
 }
 
