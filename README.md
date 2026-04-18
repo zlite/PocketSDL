@@ -4,7 +4,7 @@ This is a minimal self-driving lab demonstration to "discover" color theory by d
 Load code onto ESP32 with Platormio (change the port in the ini file to whatever your ESP32 shows up as). If you haven't set your wifi details in the code, it will prompt you to enter then on the serial terminal (115200 baud)
 
 ![insides](insides.jpg)
-
+----
 ![flashing](flashing.gif)
 
 BOM:
