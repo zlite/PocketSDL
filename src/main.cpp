@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 #include <Wire.h>
 #include <math.h>
 #include <Preferences.h>
@@ -25,7 +26,7 @@ static const char WIFI_PASS_VALUE[] = WIFI_PASS;
 
 Adafruit_NeoPixel pixel(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_AS7343   as7343;
-WebServer         server(80);
+AsyncWebServer    server(80);
 Preferences       prefs;
 
 static uint8_t ledR=0, ledG=0, ledB=0;
@@ -62,6 +63,7 @@ static const int TH_MAX=50; static Thought thBuf[TH_MAX];
 static int thHead=0, thCount=0;
 
 static const int SCORE_MAX=200; static float scoreHist[SCORE_MAX];
+static float acceptedScoreHist[SCORE_MAX];
 static int scoreHead=0, scoreLen=0;
 static int sensorReadFailures=0;
 
@@ -71,11 +73,31 @@ static void stopExperiment(const char* msg, bool turnLedOff);
 static bool hasCompileTimeWiFiCreds();
 static bool loadStoredWiFiCreds();
 static bool saveStoredWiFiCreds(const String& ssid, const String& pass);
-static String readSerialLine();
+static String readSerialLine(bool echoInput = true);
 static bool promptForWiFiCreds();
 static void connectWiFi();
+static bool parseJsonFloat(const String& body, const char* key, float& valueOut);
+static String buildStatusJson();
+static String buildScoresJson();
+static String buildThoughtsJson();
+static String buildLogJson();
+static String buildSnapshotJson(bool includeLog);
+static bool getRequestInt(AsyncWebServerRequest* request, const char* key, int& valueOut);
+static bool getRequestFloat(AsyncWebServerRequest* request, const char* key, float& valueOut);
+static bool getRequestString(AsyncWebServerRequest* request, const char* key, String& valueOut);
+static bool getRequestRgb(AsyncWebServerRequest* request, uint8_t& r, uint8_t& g, uint8_t& b);
 
-void pushScore(float s){ scoreHist[scoreHead%SCORE_MAX]=s; scoreHead++; if(scoreLen<SCORE_MAX)scoreLen++; }
+void pushScore(float s){
+  int idx=scoreHead%SCORE_MAX;
+  scoreHist[idx]=s;
+  acceptedScoreHist[idx]=-1.0f;
+  scoreHead++;
+  if(scoreLen<SCORE_MAX)scoreLen++;
+}
+void pushAcceptedScore(float s){
+  int idx=(scoreHead-1+SCORE_MAX)%SCORE_MAX;
+  acceptedScoreHist[idx]=s;
+}
 
 void addThought(uint8_t r,uint8_t g,uint8_t b,float sc,bool imp,const char* msg){
   Thought& t=thBuf[thHead%TH_MAX]; t.r=r;t.g=g;t.b=b;t.score=sc;t.improved=imp;
@@ -136,11 +158,23 @@ enum Alg { ALG_NONE=0, ALG_SPSA, ALG_BAYES, ALG_THOMPSON, ALG_CMAES };
 static Alg   alg=ALG_NONE;
 static bool  running=false, settling=false;
 static uint32_t nextMs=0;
-static const uint32_t SETTLE_MS=200, PAUSE_MS=30;
+static uint32_t settleMs=200, pauseMs=30;
+
+static float spsaInitH=40.0f, spsaInitA=60.0f;
+static int   spsaRestartPatience=40;
+static float boKappaInit=3.0f;
+static int   boCandidateCount=80;
+static float tsBwInit=0.25f;
+static int   tsCandidateCount=80;
+static float cmaSigmaInit=32.0f;
+static int   cmaMuActive=3;
 
 static uint8_t  bestR=128,bestG=128,bestB=128;
 static float    bestScore=-1.0f;
 static int      totalIter=0;
+static int      evalCount=0;
+static uint32_t runStartMs=0;
+static int32_t  hit90Ms=-1;
 static bool     converged=false;
 static int      calibPhase=0;  // 0=running, 1=dark reading, 2=target reading
 static float    lastScore=0.0f;
@@ -202,16 +236,27 @@ static bool saveStoredWiFiCreds(const String& ssid, const String& pass){
   return ok;
 }
 
-static String readSerialLine(){
+static String readSerialLine(bool echoInput){
   String line;
   while(true){
     while(!Serial.available()) delay(10);
     char c = (char)Serial.read();
     if(c == '\r') continue;
-    if(c == '\n') break;
+    if(c == '\n'){
+      if(echoInput) Serial.println();
+      break;
+    }
+    if(c == '\b' || c == 127){
+      if(line.length() > 0){
+        line.remove(line.length() - 1);
+        if(echoInput) Serial.print("\b \b");
+      }
+      continue;
+    }
+    if((uint8_t)c < 0x20) continue;
     line += c;
+    if(echoInput) Serial.print(c);
   }
-  line.trim();
   return line;
 }
 
@@ -270,19 +315,30 @@ static void connectWiFi(){
 void updateBest(uint8_t r,uint8_t g,uint8_t b,float sc,const char* alg_name){
   bool imp=(sc>bestScore);
   if(imp){ bestScore=sc; bestR=r; bestG=g; bestB=b; }
+  if(hit90Ms < 0 && imp && bestScore >= 90.0f && runStartMs > 0){
+    hit90Ms = (int32_t)(millis() - runStartMs);
+  }
   char msg[100];
   snprintf(msg,99,"%s step %d: rgb(%d,%d,%d) score=%.1f%s",
     alg_name,totalIter,r,g,b,sc,imp?" ↑ BETTER":"");
   setStateMessage(msg);
   addThought(r,g,b,sc,imp,msg);
   pushScore(sc);
+  pushAcceptedScore(sc);
   totalIter++;
-  if(bestScore>95.0f || totalIter>=400){
+  if(bestScore>95.0f){
     converged=true;
     snprintf(msg,99,"CONVERGED — Recipe: R=%d%% G=%d%% B=%d%% (score=%.1f%%)",
       (int)(bestR/2.55f),(int)(bestG/2.55f),(int)(bestB/2.55f),bestScore);
     setStateMessage(msg);
     addThought(bestR,bestG,bestB,bestScore,true,msg);
+    running=false; setLED(bestR,bestG,bestB);
+  } else if(evalCount>=400){
+    converged=false;
+    snprintf(msg,99,"BUDGET REACHED — Recipe: R=%d%% G=%d%% B=%d%% (score=%.1f%%)",
+      (int)(bestR/2.55f),(int)(bestG/2.55f),(int)(bestB/2.55f),bestScore);
+    setStateMessage(msg);
+    addThought(bestR,bestG,bestB,bestScore,false,msg);
     running=false; setLED(bestR,bestG,bestB);
   }
 }
@@ -290,6 +346,9 @@ void updateBest(uint8_t r,uint8_t g,uint8_t b,float sc,const char* alg_name){
 void resetAll(){
   logHead=logCount=0; thHead=thCount=0; scoreHead=scoreLen=0;
   bestScore=-1.0f; bestR=bestG=bestB=128; totalIter=0; converged=false;
+  evalCount=0;
+  runStartMs=0;
+  hit90Ms=-1;
   lastScore=0.0f;
   sensorReadFailures=0;
 }
@@ -304,7 +363,7 @@ static int     spPhase=0, spK=0, spNoImprov=0;
 
 void initSPSA(){
   spRf=random(256); spGf=random(256); spBf=random(256);
-  spH=40.0f; spA=60.0f; spPhase=0; spK=0; spNoImprov=0;
+  spH=spsaInitH; spA=spsaInitA; spPhase=0; spK=0; spNoImprov=0;
 }
 // 3 phases per gradient step: probe+, probe-, evaluate updated position
 void stepSPSA(){
@@ -338,11 +397,11 @@ void afterSPSA(const Reading& rd, float sc){
   float prevBest=bestScore;
   updateBest((uint8_t)spRf,(uint8_t)spGf,(uint8_t)spBf,sc,"GD-SPSA");
   if(sc>prevBest+0.5f) spNoImprov=0; else spNoImprov++;
-  if(!converged && spNoImprov>40){
+  if(!converged && spNoImprov>spsaRestartPatience){
     // Stuck in local optimum — restart from new random position
     addThought(spRf,spGf,spBf,sc,false,"SPSA stuck, restarting random...");
     spRf=random(256); spGf=random(256); spBf=random(256);
-    spH=40.0f; spK=0; spNoImprov=0;
+    spH=spsaInitH; spK=0; spNoImprov=0;
   }
   spPhase=0;
 }
@@ -354,12 +413,13 @@ static BOObs   boHist[BO_MAX]; static int boLen=0;
 static float   boKappa=3.0f;
 
 void initBO(){
-  boLen=0; boKappa=3.0f;
+  boLen=0; boKappa=boKappaInit;
   setLED(random(256),random(256),random(256)); // start random
 }
 float boIDW(float r,float g,float b, float* varOut){
+  int nObs=min(boLen,BO_MAX);
   float wsum=0,wmean=0,wvar=0;
-  for(int i=0;i<boLen;i++){
+  for(int i=0;i<nObs;i++){
     float dr=(r-boHist[i].r)/255.0f, dg=(g-boHist[i].g)/255.0f, db=(b-boHist[i].b)/255.0f;
     float d2=dr*dr+dg*dg+db*db;
     float w=1.0f/(d2+1e-4f);
@@ -367,7 +427,7 @@ float boIDW(float r,float g,float b, float* varOut){
   }
   if(wsum<1e-9f){ *varOut=50.0f*50.0f; return 50.0f; }
   float mean=wmean/wsum;
-  for(int i=0;i<boLen;i++){
+  for(int i=0;i<nObs;i++){
     float dr=(r-boHist[i].r)/255.0f, dg=(g-boHist[i].g)/255.0f, db=(b-boHist[i].b)/255.0f;
     float d2=dr*dr+dg*dg+db*db; float w=1.0f/(d2+1e-4f);
     float diff=boHist[i].score-mean; wvar+=w*diff*diff;
@@ -378,7 +438,7 @@ void stepBO(){
   if(boLen<2){ setLED(random(256),random(256),random(256)); return; }
   // Sample 80 candidates, pick highest UCB
   uint8_t bR=bestR,bG=bestG,bB=bestB; float bAcq=-1e9;
-  for(int k=0;k<80;k++){
+  for(int k=0;k<boCandidateCount;k++){
     uint8_t cr=random(256),cg=random(256),cb=random(256);
     float v; float m=boIDW(cr,cg,cb,&v);
     float acq=m+boKappa*sqrtf(v);
@@ -399,21 +459,22 @@ struct TSObs { float r,g,b,score; };
 static TSObs   tsHist[TS_MAX]; static int tsLen=0;
 static float   tsBW=0.25f; // kernel bandwidth
 
-void initTS(){ tsLen=0; setLED(random(256),random(256),random(256)); }
+void initTS(){ tsLen=0; tsBW=tsBwInit; setLED(random(256),random(256),random(256)); }
 void stepTS(){
   if(tsLen<3){ setLED(random(256),random(256),random(256)); return; }
+  int nObs=min(tsLen,TS_MAX);
   uint8_t bR=bestR,bG=bestG,bB=bestB; float bSamp=-1e9;
-  for(int k=0;k<80;k++){
+  for(int k=0;k<tsCandidateCount;k++){
     uint8_t cr=random(256),cg=random(256),cb=random(256);
     // Gaussian kernel posterior
     float wsum=0,wmean=0,wvar=0;
-    for(int i=0;i<min(tsLen,TS_MAX);i++){
+    for(int i=0;i<nObs;i++){
       float dr=(cr-tsHist[i].r)/255.0f,dg=(cg-tsHist[i].g)/255.0f,db=(cb-tsHist[i].b)/255.0f;
       float w=expf(-(dr*dr+dg*dg+db*db)/(2.0f*tsBW*tsBW));
       wsum+=w; wmean+=w*tsHist[i].score;
     }
     float mean=(wsum>1e-9f)?wmean/wsum:50.0f;
-    for(int i=0;i<min(tsLen,TS_MAX);i++){
+    for(int i=0;i<nObs;i++){
       float dr=(cr-tsHist[i].r)/255.0f,dg=(cg-tsHist[i].g)/255.0f,db=(cb-tsHist[i].b)/255.0f;
       float w=expf(-(dr*dr+dg*dg+db*db)/(2.0f*tsBW*tsBW));
       float diff=tsHist[i].score-mean; wvar+=w*diff*diff;
@@ -432,7 +493,7 @@ void afterTS(const Reading& rd, float sc){
 }
 
 // ── Algorithm 4: CMA-ES (diagonal covariance) ─────────────────────────────────
-static const int CMA_LAM=6, CMA_MU=3;
+static const int CMA_LAM=6;
 static float cmaM[3]={128,128,128};
 static float cmaSig=32.0f;
 static float cmaSD[3]={1.0f,1.0f,1.0f}; // per-dim scale (diagonal sqrt(C))
@@ -444,7 +505,7 @@ static const float CMA_CC=0.4f,   CMA_C1=0.2f;
 
 void initCMA(){
   cmaM[0]=random(256); cmaM[1]=random(256); cmaM[2]=random(256); // start random
-  cmaSig=32.0f; cmaSD[0]=cmaSD[1]=cmaSD[2]=1.0f;
+  cmaSig=cmaSigmaInit; cmaSD[0]=cmaSD[1]=cmaSD[2]=1.0f;
   cmaPS[0]=cmaPS[1]=cmaPS[2]=0; cmaPhase=0; cmaGen=0;
   // Generate first generation
   for(int k=0;k<CMA_LAM;k++)
@@ -466,17 +527,17 @@ void afterCMA(const Reading& rd, float sc){
 
   // Weighted mean of top-mu offspring
   float wNew[3]={0,0,0};
-  for(int i=0;i<CMA_MU;i++){
+  for(int i=0;i<cmaMuActive;i++){
     float w=1.0f/(i+1); // simple 1/rank weights
     for(int d=0;d<3;d++) wNew[d]+=w*(float)cmaOff[rank[i]][d];
   }
-  float wsum=0; for(int i=0;i<CMA_MU;i++) wsum+=1.0f/(i+1);
+  float wsum=0; for(int i=0;i<cmaMuActive;i++) wsum+=1.0f/(i+1);
   float step[3];
   for(int d=0;d<3;d++){ wNew[d]/=wsum; step[d]=(wNew[d]-cmaM[d])/(cmaSig*cmaSD[d]); cmaM[d]=wNew[d]; }
 
   // Update evolution path and per-dim std
   for(int d=0;d<3;d++){
-    cmaPS[d]=(1-CMA_CSig)*cmaPS[d]+sqrtf(CMA_CSig*(2-CMA_CSig)*CMA_MU)*step[d];
+    cmaPS[d]=(1-CMA_CSig)*cmaPS[d]+sqrtf(CMA_CSig*(2-CMA_CSig)*cmaMuActive)*step[d];
     cmaSD[d]=cmaSD[d]*expf(CMA_C1/2*(cmaPS[d]*cmaPS[d]-1));
     cmaSD[d]=constrain(cmaSD[d],0.1f,5.0f);
   }
@@ -538,6 +599,28 @@ static bool parseJsonInt(const String& body, const char* key, int& valueOut){
   return true;
 }
 
+static bool parseJsonFloat(const String& body, const char* key, float& valueOut){
+  String needle = "\"" + String(key) + "\"";
+  int keyPos = body.indexOf(needle);
+  if(keyPos < 0) return false;
+  int colon = body.indexOf(':', keyPos + needle.length());
+  if(colon < 0) return false;
+  int start = skipWs(body, colon + 1);
+  if(start >= body.length()) return false;
+  int end = start;
+  if(body[end] == '-') end++;
+  bool sawDigit=false, sawDot=false;
+  while(end < body.length()){
+    char c = body[end];
+    if(isdigit((unsigned char)c)){ sawDigit=true; end++; continue; }
+    if(c == '.' && !sawDot){ sawDot=true; end++; continue; }
+    break;
+  }
+  if(!sawDigit) return false;
+  valueOut = body.substring(start, end).toFloat();
+  return true;
+}
+
 static bool parseRgbRequest(const String& body, uint8_t& r, uint8_t& g, uint8_t& b){
   int ri=0, gi=0, bi=0;
   if(!parseJsonInt(body,"r",ri) || !parseJsonInt(body,"g",gi) || !parseJsonInt(body,"b",bi)) return false;
@@ -586,6 +669,19 @@ button{border:none;border-radius:7px;padding:7px 16px;font-size:.8rem;font-weigh
 .alg{border:2px solid var(--bd);border-radius:7px;padding:8px 10px;cursor:pointer;transition:all .15s}
 .alg:hover{border-color:#4a4870}.alg.active{border-color:var(--acc);background:#1c1840}
 .alg .nm{font-weight:600;font-size:.78rem}.alg .ds{font-size:.67rem;color:var(--dim);margin-top:3px;line-height:1.4}
+.tune-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.tune-shell{display:none;margin-top:10px}
+.tune-shell.open{display:block}
+.tune-group{display:none;grid-column:1/-1}
+.tune-group.active{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.tune-field{background:#111520;border:1px solid var(--bd);border-radius:8px;padding:8px}
+.tune-field.wide{grid-column:1/-1}
+.tune-field label{display:block;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;color:var(--dim);margin-bottom:5px}
+.tune-field input{width:100%;background:#1e2130;border:1px solid var(--bd);color:var(--tx);border-radius:6px;padding:6px 8px;font-size:.78rem}
+.tune-field .hint{font-size:.64rem;line-height:1.35;color:#8790b3;margin-top:5px}
+.tune-actions{display:flex;justify-content:space-between;align-items:center;margin-top:8px}
+.btn-subtle{background:#1a1d28;color:#cdd1e5;border:1px solid var(--bd);padding:6px 10px}
+.btn-subtle:hover{background:#242938}
 /* Hyp bars */
 .ch-row{display:flex;align-items:center;gap:7px;margin-bottom:5px}
 .ch-lbl{font-size:.72rem;font-weight:700;width:10px}
@@ -601,19 +697,29 @@ button{border:none;border-radius:7px;padding:7px 16px;font-size:.8rem;font-weigh
 .msg{font-size:.72rem;color:var(--dim);margin:7px 0;padding:5px 8px;background:#111520;border-radius:5px;border-left:3px solid var(--acc);min-height:30px;line-height:1.5}
 .msg.ok{border-left-color:#0c6;color:#9fd}.msg.done{border-left-color:#ffd700;color:#ffd700}
 /* Think log */
-.tlog{max-height:170px;overflow-y:auto;font-size:.7rem;font-family:monospace}
-.tl{display:flex;gap:5px;align-items:flex-start;padding:2px 0;border-bottom:1px solid #111520}
-.td{width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-top:3px}
-.tt{color:var(--dim);line-height:1.4}.tt.imp{color:#9fd}
+.tlog{max-height:240px;overflow-y:auto;font-size:.7rem;font-family:monospace}
+.tl{display:flex;gap:7px;align-items:flex-start;padding:6px 0;border-bottom:1px solid #111520}
+.td{width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-top:4px}
+.tt{color:var(--dim);line-height:1.45;flex:1}.tt.imp{color:#9fd}
+.tl-tag{display:inline-block;font-size:.58rem;letter-spacing:1px;text-transform:uppercase;border:1px solid var(--bd);border-radius:999px;padding:1px 6px;margin-right:6px;color:#9aa0bd;background:#111520}
+.tl-tag.imp{border-color:#145;color:#9fd;background:#0d1b22}
 /* Right column */
 .rcol{display:flex;flex-direction:column;gap:12px}
+.guide{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+@media(max-width:680px){.guide{grid-template-columns:1fr}}
+.guide-box{background:#111520;border:1px solid var(--bd);border-radius:8px;padding:9px 10px}
+.guide-k{font-size:.58rem;letter-spacing:1px;text-transform:uppercase;color:var(--dim);margin-bottom:4px}
+.guide-v{font-size:.76rem;line-height:1.45;color:#eef}
+.alg-hint{margin-top:8px;padding:8px 10px;background:linear-gradient(180deg,#121528,#0f1220);border:1px solid var(--bd);border-radius:8px}
+.alg-hint .nm{font-size:.76rem;font-weight:700;color:#fff;margin-bottom:4px}
+.alg-hint .ds{font-size:.68rem;line-height:1.45;color:#aeb4d0}
 canvas{width:100%;display:block;border-radius:5px}
 .leg{display:flex;gap:14px;font-size:.7rem;color:var(--dim);margin-bottom:6px;align-items:center}
 .leg-sq{display:inline-block;width:11px;height:11px;border-radius:2px;vertical-align:middle;margin-right:3px}
 /* Raw bars */
 .bars{display:flex;align-items:flex-end;gap:2px;height:80px}
 .bw{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px}
-.b{width:100%;border-radius:2px 2px 0 0;min-height:1px;transition:height .3s}
+.rawb{width:100%;border-radius:2px 2px 0 0;min-height:1px;transition:height .3s}
 .bl{font-size:7px;color:var(--dim);writing-mode:vertical-rl;transform:rotate(180deg);height:22px}
 /* Explore tab */
 .exp-page{display:none;max-width:980px;margin:0 auto}
@@ -679,6 +785,85 @@ td:nth-child(-n+5){text-align:left}
       </div>
     </div>
 
+    <div class="card">
+      <h2>2B - Advanced Tuning</h2>
+      <div class="tune-actions" style="margin-top:0;margin-bottom:8px">
+        <span style="font-size:.66rem;color:var(--dim)">Tune search speed, exploration, and restart behavior.</span>
+        <button class="btn-subtle" id="tuneToggle" onclick="toggleTuning()">Expand</button>
+      </div>
+      <div class="tune-shell" id="tuneShell">
+      <div class="tune-grid">
+        <div class="tune-field">
+          <label for="tSettle">Settle Time (ms)</label>
+          <input id="tSettle" type="number" min="50" max="1000" step="10" value="200">
+          <div class="hint">Lower is faster, higher is steadier.</div>
+        </div>
+        <div class="tune-field">
+          <label for="tPause">Pause Time (ms)</label>
+          <input id="tPause" type="number" min="0" max="500" step="5" value="30">
+          <div class="hint">Extra idle time between experiments.</div>
+        </div>
+        <div class="tune-group active" data-tune="spsa">
+          <div class="tune-field">
+            <label for="tSpsaH">SPSA Step Size</label>
+            <input id="tSpsaH" type="number" min="2" max="120" step="1" value="40">
+            <div class="hint">How far each plus/minus probe jumps.</div>
+          </div>
+          <div class="tune-field">
+            <label for="tSpsaA">SPSA Learning Rate</label>
+            <input id="tSpsaA" type="number" min="5" max="150" step="1" value="60">
+            <div class="hint">How aggressively it moves after estimating a slope.</div>
+          </div>
+          <div class="tune-field wide">
+            <label for="tSpsaRestart">SPSA Restart Patience</label>
+            <input id="tSpsaRestart" type="number" min="5" max="120" step="1" value="40">
+            <div class="hint">Steps without meaningful improvement before a random restart.</div>
+          </div>
+        </div>
+        <div class="tune-group" data-tune="bayes">
+          <div class="tune-field">
+            <label for="tBoKappa">BO Exploration Weight</label>
+            <input id="tBoKappa" type="number" min="0.2" max="8" step="0.1" value="3.0">
+            <div class="hint">Higher values reward uncertainty more strongly.</div>
+          </div>
+          <div class="tune-field">
+            <label for="tBoCand">BO Candidate Count</label>
+            <input id="tBoCand" type="number" min="16" max="160" step="4" value="80">
+            <div class="hint">More samples improve decisions but cost time.</div>
+          </div>
+        </div>
+        <div class="tune-group" data-tune="thompson">
+          <div class="tune-field">
+            <label for="tTsBw">TS Bandwidth</label>
+            <input id="tTsBw" type="number" min="0.05" max="0.8" step="0.01" value="0.25">
+            <div class="hint">Smaller values stay local; larger values smooth more.</div>
+          </div>
+          <div class="tune-field">
+            <label for="tTsCand">TS Candidate Count</label>
+            <input id="tTsCand" type="number" min="16" max="160" step="4" value="80">
+            <div class="hint">More hypothetical draws make each choice more selective.</div>
+          </div>
+        </div>
+        <div class="tune-group" data-tune="cmaes">
+          <div class="tune-field">
+            <label for="tCmaSig">CMA Initial Sigma</label>
+            <input id="tCmaSig" type="number" min="4" max="96" step="1" value="32">
+            <div class="hint">Initial search spread for each generation.</div>
+          </div>
+          <div class="tune-field">
+            <label for="tCmaMu">CMA Elite Count</label>
+            <input id="tCmaMu" type="number" min="1" max="6" step="1" value="3">
+            <div class="hint">How many top candidates shape the next generation.</div>
+          </div>
+        </div>
+      </div>
+      <div class="tune-actions">
+        <span style="font-size:.64rem;color:var(--dim)">These settings apply when you press Search.</span>
+        <button class="btn-subtle" onclick="resetTuning()">Reset Defaults</button>
+      </div>
+      </div>
+    </div>
+
     <!-- 3. Hypothesis -->
     <div class="card">
       <h2>3 — Current Experiment &amp; Hypothesis</h2>
@@ -697,9 +882,12 @@ td:nth-child(-n+5){text-align:left}
           <span style="font-size:.6rem;color:#0c6;text-align:center">Best<br>Found</span>
         </div>
       </div>
-      <div class="stats">
-        <div class="stat"><span class="v" id="sIter">0</span><span class="l">Step</span></div>
+      <div class="stats" style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+        <div class="stat"><span class="v" id="sIter">0</span><span class="l">Decision Steps</span></div>
+        <div class="stat"><span class="v" id="sEvals">0</span><span class="l">Evaluations</span></div>
         <div class="stat"><span class="v" id="sScore" style="color:#0c6">&#8212;</span><span class="l">Best Score</span></div>
+        <div class="stat"><span class="v" id="sElapsed">&#8212;</span><span class="l">Elapsed</span></div>
+        <div class="stat"><span class="v" id="sHit90">Not yet</span><span class="l">Reached 90% At</span></div>
         <div class="stat"><span class="v" id="sSensor">&#8212;</span><span class="l">Sensor</span></div>
       </div>
       <div class="row" style="margin-top:4px">
@@ -729,6 +917,20 @@ td:nth-child(-n+5){text-align:left}
     <div class="card">
       <h2>Match Score over Iterations</h2>
       <canvas id="scoreCv" height="130"></canvas>
+      <div class="guide">
+        <div class="guide-box">
+          <div class="guide-k">What It Is Doing</div>
+          <div class="guide-v" id="algPhase">Choose a target and start a search.</div>
+        </div>
+        <div class="guide-box">
+          <div class="guide-k">Why This Move</div>
+          <div class="guide-v" id="algWhy">The panel will explain whether the algorithm is exploring, refining, or locking onto a better recipe.</div>
+        </div>
+      </div>
+      <div class="alg-hint">
+        <div class="nm" id="algName">Gradient Descent</div>
+        <div class="ds" id="algDesc">Tests paired nudges around the current color to estimate which RGB direction improves the score fastest.</div>
+      </div>
     </div>
   </div>
 </div>
@@ -767,6 +969,7 @@ function genTargetSpec(r,g,b){ const rf=r/255,gf=g/255,bf=b/255; return W_R.map(
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
 function showTab(n,el){
+  activeTab=n;
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active')); el.classList.add('active');
   document.querySelectorAll('.page,.exp-page').forEach(p=>p.classList.remove('active'));
   document.getElementById('tab-'+n).classList.add('active');
@@ -789,23 +992,112 @@ function applyTarget(){
 }
 
 // ── Algorithm selection ───────────────────────────────────────────────────────
+const ALG_META={
+  spsa:{
+    name:'Gradient Descent',
+    desc:'Tests paired nudges around the current color to estimate which RGB direction improves the score fastest.'
+  },
+  bayes:{
+    name:'Bayesian Optimisation',
+    desc:'Builds a lightweight model of the color landscape, then probes places that look promising or still uncertain.'
+  },
+  thompson:{
+    name:'Thompson Sampling',
+    desc:'Acts on sampled beliefs about the best next color, so it naturally alternates between curiosity and confidence.'
+  },
+  cmaes:{
+    name:'CMA-ES',
+    desc:'Tries a population of candidate colors, keeps the stronger ones, and reshapes the search region generation by generation.'
+  }
+};
+const TUNING_DEFAULTS={
+  settle:200,
+  pause:30,
+  spsaH:40,
+  spsaA:60,
+  spsaRestart:40,
+  boKappa:3.0,
+  boCand:80,
+  tsBw:0.25,
+  tsCand:80,
+  cmaSig:32,
+  cmaMu:3
+};
 let curAlg='spsa';
+let latestThoughts=[];
+let latestStatus=null;
+let hasRunStarted=false;
+let tuningOpen=false;
+function setTuningVisibility(){
+  document.querySelectorAll('.tune-group').forEach(g=>g.classList.toggle('active',g.dataset.tune===curAlg));
+}
+function toggleTuning(forceOpen){
+  if(typeof forceOpen === 'boolean') tuningOpen=forceOpen;
+  else tuningOpen=!tuningOpen;
+  const shell=document.getElementById('tuneShell');
+  const btn=document.getElementById('tuneToggle');
+  if(shell) shell.classList.toggle('open',tuningOpen);
+  if(btn) btn.textContent=tuningOpen?'Collapse':'Expand';
+}
+function resetTuning(){
+  document.getElementById('tSettle').value=TUNING_DEFAULTS.settle;
+  document.getElementById('tPause').value=TUNING_DEFAULTS.pause;
+  document.getElementById('tSpsaH').value=TUNING_DEFAULTS.spsaH;
+  document.getElementById('tSpsaA').value=TUNING_DEFAULTS.spsaA;
+  document.getElementById('tSpsaRestart').value=TUNING_DEFAULTS.spsaRestart;
+  document.getElementById('tBoKappa').value=TUNING_DEFAULTS.boKappa.toFixed(1);
+  document.getElementById('tBoCand').value=TUNING_DEFAULTS.boCand;
+  document.getElementById('tTsBw').value=TUNING_DEFAULTS.tsBw.toFixed(2);
+  document.getElementById('tTsCand').value=TUNING_DEFAULTS.tsCand;
+  document.getElementById('tCmaSig').value=TUNING_DEFAULTS.cmaSig;
+  document.getElementById('tCmaMu').value=TUNING_DEFAULTS.cmaMu;
+  setTuningVisibility();
+}
+function getTuningPayload(){
+  return {
+    settle_ms:parseInt(document.getElementById('tSettle').value,10),
+    pause_ms:parseInt(document.getElementById('tPause').value,10),
+    spsa_h:parseFloat(document.getElementById('tSpsaH').value),
+    spsa_a:parseFloat(document.getElementById('tSpsaA').value),
+    spsa_restart:parseInt(document.getElementById('tSpsaRestart').value,10),
+    bo_kappa:parseFloat(document.getElementById('tBoKappa').value),
+    bo_candidates:parseInt(document.getElementById('tBoCand').value,10),
+    ts_bw:parseFloat(document.getElementById('tTsBw').value),
+    ts_candidates:parseInt(document.getElementById('tTsCand').value,10),
+    cma_sigma:parseFloat(document.getElementById('tCmaSig').value),
+    cma_mu:parseInt(document.getElementById('tCmaMu').value,10)
+  };
+}
 function selAlg(el){
   document.querySelectorAll('.alg').forEach(a=>a.classList.remove('active')); el.classList.add('active');
   curAlg=el.dataset.alg;
+  setTuningVisibility();
+  renderAlgNarrative();
 }
 
 // ── Recipe search ─────────────────────────────────────────────────────────────
 let poll=null, scoreHistory=[];
+let pollBusy=false, auxBusy=false, pollTick=0;
+let activeTab='recipe';
+let lastThoughtKey='';
 async function startSearch(){
   const {r,g,b}=targetRGB;
-  const res=await fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({algorithm:curAlg,r,g,b})});
+  const res=await fetch('/start',{method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},
+    body:new URLSearchParams({algorithm:curAlg,r,g,b,...getTuningPayload()})});
   if(!res.ok)return;
   scoreHistory=[];
+  latestThoughts=[];
+  latestStatus=null;
+  hasRunStarted=true;
+  lastTH=0;
+  lastThoughtKey='';
+  document.getElementById('tlog').innerHTML='<div style="color:var(--dim)">Search started. First experiments will appear here&hellip;</div>';
   document.getElementById('btnSearch').disabled=true;
   document.getElementById('btnStop2').disabled=false;
   document.getElementById('dot2').className='dot dot-run';
+  pollBusy=false; auxBusy=false; pollTick=0;
+  renderAlgNarrative();
   poll=setInterval(doPoll,800);
 }
 async function stopExp(){ await fetch('/stop',{method:'POST'}); endPoll(); }
@@ -826,13 +1118,29 @@ function endPoll(){
   document.getElementById('btnSearch').disabled=false;
   document.getElementById('btnStop2').disabled=false;
   document.getElementById('dot2').className='dot dot-idle';
+  renderAlgNarrative();
+}
+function formatDuration(ms){
+  if(ms == null || ms < 0) return '—';
+  if(ms < 10000) return (ms/1000).toFixed(1)+'s';
+  return (ms/1000).toFixed(0)+'s';
+}
+function formatHit90(ms){
+  if(ms == null || ms < 0) return 'Not yet';
+  return formatDuration(ms);
 }
 async function doPoll(){
+  if(pollBusy) return;
+  pollBusy=true;
   try{
-    const d=await(await fetch('/status')).json();
-    updateUI(d); if(!d.running) endPoll();
-    fetchThoughts(); fetchLog();
+    const snap=await(await fetch(activeTab === 'explore' ? '/snapshot?log=1' : '/snapshot')).json();
+    latestStatus=snap.status;
+    updateUI(snap.status); if(!snap.status.running) endPoll();
+    renderScores(snap.scores || []);
+    renderThoughts(snap.thoughts || []);
+    if(snap.log) renderLogRows(snap.log);
   }catch(e){}
+  finally{ pollBusy=false; }
 }
 const ALG_NAME={spsa:'GD',bayes:'BO',thompson:'TS',cmaes:'CMA-ES'};
 function updateUI(d){
@@ -848,12 +1156,16 @@ function updateUI(d){
     document.getElementById('p'+c).textContent=v+'%';
   });
   document.getElementById('sIter').textContent=rec.iter;
+  document.getElementById('sEvals').textContent=rec.evals ?? 0;
   document.getElementById('sScore').textContent=rec.bestScore>=0?rec.bestScore.toFixed(1)+'%':'—';
+  document.getElementById('sElapsed').textContent=formatDuration(rec.elapsedMs);
+  document.getElementById('sHit90').textContent=formatHit90(rec.hit90Ms);
   const se=document.getElementById('sSensor');
   se.textContent=d.sensor?'OK':'ERR'; se.style.color=d.sensor?'#0c6':'#e33';
   const msgEl=document.getElementById('sMsg');
   msgEl.textContent=rec.msg;
   msgEl.className='msg'+(rec.converged?' done':rec.bestScore>70?' ok':'');
+  renderAlgNarrative(d);
   // Update raw bars
   if(d.channels){
     const mx=Math.max(...d.channels,1);
@@ -861,8 +1173,90 @@ function updateUI(d){
     document.getElementById('eCount').textContent=d.count;
     drawSpectra(d.channels, d.lastScore);
   }
-  // Fetch and plot scores
-  fetchScores();
+}
+
+function getAlgorithmKeyFromStatus(d){
+  if(d && typeof d.algorithm === 'number'){
+    return {1:'spsa',2:'bayes',3:'thompson',4:'cmaes'}[d.algorithm] || curAlg;
+  }
+  return curAlg;
+}
+
+function getLatestThought(){
+  return latestThoughts.length ? latestThoughts[latestThoughts.length-1] : null;
+}
+
+function renderAlgNarrative(d){
+  d=d || latestStatus;
+  const algKey=getAlgorithmKeyFromStatus(d);
+  const meta=ALG_META[algKey] || ALG_META.spsa;
+  document.getElementById('algName').textContent=meta.name;
+  document.getElementById('algDesc').textContent=meta.desc;
+
+  let phase='Choose a target and start a search.';
+  let why='The panel will explain whether the algorithm is exploring, refining, or locking onto a better recipe.';
+
+  if(d){
+    const rec=d.recipe || {};
+    const msg=(rec.msg || '').toLowerCase();
+    const latest=allScores.length ? allScores[allScores.length-1] : null;
+    const prev=allScores.length > 1 ? allScores[allScores.length-2] : null;
+    const delta=(latest != null && prev != null) ? latest - prev : null;
+    const thought=getLatestThought();
+
+    if(!d.running && rec.iter===0){
+      phase='Ready to search. The next run will first measure ambient light before it begins testing candidate colors.';
+      why='That dark-frame baseline keeps the score focused on the LED spectrum instead of room lighting.';
+    } else if(msg.includes('dark frame')){
+      phase='Measuring the dark frame so the score reflects LED color rather than ambient light.';
+      why='This baseline is subtracted from later readings, which makes the comparisons much more honest.';
+    } else if(msg.includes('random start')){
+      phase='Seeding the search with an initial guess before the algorithm begins steering toward better colors.';
+      why='A starting probe gives the algorithm its first local evidence about which RGB directions look promising.';
+    } else if(rec.converged){
+      phase=`Locked onto a strong recipe at ${rec.bestScore.toFixed(1)}%. The LED is now showing the best color found.`;
+      why='The run hit the score threshold, so it stopped early and kept the strongest recipe it found.';
+    } else if(msg.includes('budget reached')){
+      phase=`Search budget exhausted at ${rec.bestScore.toFixed(1)}%. The LED is showing the best recipe found within the allowed evaluations.`;
+      why='This run stopped because it used up its measurement budget, not because it crossed the high-quality score threshold.';
+    } else if(d.running){
+      if(algKey==='spsa'){
+        phase='Comparing tiny paired RGB nudges to estimate which direction climbs the score fastest.';
+        why=delta != null && delta > 0
+          ? `The last move improved the score by ${delta.toFixed(1)} points, so Gradient Descent is pushing harder in that direction.`
+          : 'If a local nudge does not help, the next step pivots and samples a different slope around the current color.';
+      } else if(algKey==='bayes'){
+        phase='Balancing model confidence against uncertainty, so it can revisit strong regions without ignoring unexplored ones.';
+        why=thought && thought.improved
+          ? 'A recent improvement sharpens the model around that neighborhood, which changes where the next informative probes land.'
+          : 'Bayesian Optimisation sometimes spends a step learning the landscape, not just chasing the current best guess.';
+      } else if(algKey==='thompson'){
+        phase='Sampling one plausible version of the hidden color landscape, then probing where that imagined landscape says to go next.';
+        why=thought && thought.improved
+          ? 'That improved sample boosts confidence around nearby colors while still leaving room for some randomness.'
+          : 'Thompson Sampling keeps healthy uncertainty alive, which helps it escape early guesses that only looked good by chance.';
+      } else if(algKey==='cmaes'){
+        phase='Trying a generation of candidate colors, then reshaping the search cloud around whichever ones performed best.';
+        why=thought && thought.improved
+          ? 'A strong offspring pulls the next generation toward that region and can also tighten or stretch the search spread.'
+          : 'CMA-ES learns the useful search geometry, so it can zoom along productive RGB directions instead of shrinking evenly.';
+      }
+
+      if(rec.bestScore >= 0 && latest != null){
+        phase += ` Current probe: ${latest.toFixed(1)}%. Best so far: ${rec.bestScore.toFixed(1)}%.`;
+        why += ` The current gap to the best-known recipe is ${(rec.bestScore - latest).toFixed(1)} points.`;
+      }
+    } else if(rec.iter > 0){
+      phase=`Search paused after ${rec.iter} steps with a best score of ${rec.bestScore.toFixed(1)}%.`;
+      why='The score curve and thinking log now show whether the search had started refining near the answer or was still exploring broadly.';
+    }
+  } else if(hasRunStarted){
+    phase='Waiting for the next live search update...';
+    why='The most recent measurements are being collected before the explanation panel refreshes.';
+  }
+
+  document.getElementById('algPhase').textContent=phase;
+  document.getElementById('algWhy').textContent=why;
 }
 
 // ── Spectral fingerprint ──────────────────────────────────────────────────────
@@ -916,12 +1310,17 @@ function drawSpectra(measured, score){
 }
 
 // ── Score plot (ascending) ────────────────────────────────────────────────────
-let allScores=[];
-async function fetchScores(){
-  try{
-    const s=await(await fetch('/scores')).json();
-    allScores=s; drawScoreChart();
-  }catch(e){}
+let allScores=[], acceptedScores=[];
+function renderScores(scores){
+  if(Array.isArray(scores)){
+    allScores=scores;
+    acceptedScores=scores.slice();
+  }else{
+    allScores=Array.isArray(scores?.all)?scores.all:[];
+    acceptedScores=Array.isArray(scores?.accepted)?scores.accepted:[];
+  }
+  drawScoreChart();
+  renderAlgNarrative();
 }
 function drawScoreChart(){
   const cv=document.getElementById('scoreCv');
@@ -954,9 +1353,9 @@ function drawScoreChart(){
   ctx.fillStyle='#444'; ctx.font='8px monospace'; ctx.textAlign='center';
   ctx.fillText('Score %',0,0); ctx.restore();
 
-  // Score line
+  // All measured scores
   const n=allScores.length;
-  ctx.strokeStyle='#0c6'; ctx.lineWidth=2;
+  ctx.strokeStyle='rgba(0,255,153,0.35)'; ctx.lineWidth=1.5;
   ctx.beginPath();
   allScores.forEach((v,i)=>{
     const x=PL+(n===1?cW/2:i/(n-1)*cW);
@@ -964,6 +1363,29 @@ function drawScoreChart(){
     i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
   });
   ctx.stroke();
+
+  // Accepted path
+  let acceptedCount=0;
+  ctx.strokeStyle='#0c6'; ctx.lineWidth=2.2;
+  ctx.beginPath();
+  acceptedScores.forEach((v,i)=>{
+    if(v == null || v < 0) return;
+    const x=PL+(n===1?cW/2:i/(n-1)*cW);
+    const y=PT+cH-(v/100)*cH;
+    if(acceptedCount===0) ctx.moveTo(x,y);
+    else ctx.lineTo(x,y);
+    acceptedCount++;
+  });
+  if(acceptedCount>0) ctx.stroke();
+  ctx.fillStyle='#0c6';
+  acceptedScores.forEach((v,i)=>{
+    if(v == null || v < 0) return;
+    const x=PL+(n===1?cW/2:i/(n-1)*cW);
+    const y=PT+cH-(v/100)*cH;
+    ctx.beginPath();
+    ctx.arc(x,y,2.2,0,Math.PI*2);
+    ctx.fill();
+  });
 
   // Current score dot (last point)
   const last=allScores[n-1];
@@ -973,53 +1395,78 @@ function drawScoreChart(){
   ctx.fillStyle='#aaa'; ctx.font='9px monospace'; ctx.textAlign='right';
   ctx.fillText(last.toFixed(1)+'%',lx-7,ly-5);
 
-  // Best score label
-  const best=Math.max(...allScores);
+  // Best score labels + legend
+  const probeBest=Math.max(...allScores);
+  const acceptedOnly=acceptedScores.filter(v=>v != null && v >= 0);
+  const acceptedBest=acceptedOnly.length?Math.max(...acceptedOnly):null;
   ctx.fillStyle='#0c6'; ctx.font='bold 10px monospace'; ctx.textAlign='left';
-  ctx.fillText('Best: '+best.toFixed(1)+'%',PL+2,PT+10);
+  if(acceptedBest != null) ctx.fillText('Accepted Best: '+acceptedBest.toFixed(1)+'%',PL+2,PT+10);
+  ctx.fillStyle='rgba(0,255,153,0.55)';
+  ctx.fillText('Probe Peak: '+probeBest.toFixed(1)+'%',PL+2,PT+22);
+
+  ctx.textAlign='right';
+  ctx.font='9px monospace';
+  ctx.fillStyle='rgba(0,255,153,0.35)';
+  ctx.fillRect(W-132,PT-2,10,2);
+  ctx.fillText('All measurements',W-10,PT+1);
+  ctx.fillStyle='#0c6';
+  ctx.fillRect(W-132,PT+10,10,2);
+  ctx.fillText('Accepted path',W-10,PT+13);
 }
 
 // ── Thinking log ─────────────────────────────────────────────────────────────
 let lastTH=0;
-async function fetchThoughts(){
-  try{
-    const d=await(await fetch('/thoughts')).json();
-    if(d.length===lastTH) return; lastTH=d.length;
-    const el=document.getElementById('tlog'); el.innerHTML='';
-    [...d].reverse().forEach(t=>{
-      const row=document.createElement('div'); row.className='tl';
-      const dot=document.createElement('span'); dot.className='td';
-      dot.style.background=`rgb(${t.r},${t.g},${t.b})`;
-      dot.style.boxShadow=t.improved?'0 0 3px #0c6':'none';
-      const txt=document.createElement('span'); txt.className='tt'+(t.improved?' imp':'');
-      txt.textContent=t.msg; row.appendChild(dot); row.appendChild(txt); el.appendChild(row);
-    });
-  }catch(e){}
+function renderThoughts(d){
+  latestThoughts=d;
+  const tail=d.length ? d[d.length-1] : null;
+  const key=tail ? `${d.length}:${tail.msg}:${tail.score}:${tail.r},${tail.g},${tail.b}` : '0';
+  if(key===lastThoughtKey) return;
+  lastThoughtKey=key;
+  lastTH=d.length;
+  const el=document.getElementById('tlog'); el.innerHTML='';
+  [...d].reverse().forEach(t=>{
+    const row=document.createElement('div'); row.className='tl';
+    const dot=document.createElement('span'); dot.className='td';
+    dot.style.background=`rgb(${t.r},${t.g},${t.b})`;
+    dot.style.boxShadow=t.improved?'0 0 3px #0c6':'none';
+    const txt=document.createElement('span'); txt.className='tt'+(t.improved?' imp':'');
+    const tag=document.createElement('span');
+    tag.className='tl-tag'+(t.improved?' imp':'');
+    tag.textContent=t.msg.includes('CONVERGED')?'locked':(t.msg.includes('BUDGET REACHED')?'budget':(t.improved?'better':'probe'));
+    txt.appendChild(tag);
+    txt.appendChild(document.createTextNode(t.msg));
+    row.appendChild(dot); row.appendChild(txt); el.appendChild(row);
+  });
+  renderAlgNarrative();
 }
 
 // ── Explore log ───────────────────────────────────────────────────────────────
-async function fetchLog(){
-  try{
-    const rows=await(await fetch('/log')).json();
-    const tb=document.getElementById('logTb'); tb.innerHTML='';
-    rows.slice(-12).reverse().forEach((row,i)=>{
-      const tr=document.createElement('tr');
-      const cells=[rows.length-i,`<span class="sc" style="background:rgb(${row.r},${row.g},${row.b})"></span>`,
-        row.r,row.g,row.b,row.ch[12],row.ch[6],row.ch[0],row.ch[7],row.ch[8],row.ch[15],row.ch[2],row.ch[9],row.ch[13],row.ch[4]];
-      tr.innerHTML=cells.map(v=>`<td>${v}</td>`).join('');
-      tr.style.background=`rgba(${row.r},${row.g},${row.b},0.06)`; tb.appendChild(tr);
-    });
-    document.getElementById('eCount').textContent=rows.length;
-    const se=document.getElementById('eSensor'); // update from log page too
-  }catch(e){}
+function renderLogRows(rows){
+  const tb=document.getElementById('logTb'); tb.innerHTML='';
+  rows.slice(-12).reverse().forEach((row,i)=>{
+    const tr=document.createElement('tr');
+    const cells=[rows.length-i,`<span class="sc" style="background:rgb(${row.r},${row.g},${row.b})"></span>`,
+      row.r,row.g,row.b,row.ch[12],row.ch[6],row.ch[0],row.ch[7],row.ch[8],row.ch[15],row.ch[2],row.ch[9],row.ch[13],row.ch[4]];
+    tr.innerHTML=cells.map(v=>`<td>${v}</td>`).join('');
+    tr.style.background=`rgba(${row.r},${row.g},${row.b},0.06)`; tb.appendChild(tr);
+  });
+  document.getElementById('eCount').textContent=rows.length;
+  const se=document.getElementById('eSensor');
+  se.textContent=document.getElementById('sSensor').textContent;
+  se.style.color=document.getElementById('sSensor').style.color;
 }
 
 // ── Build raw bars ────────────────────────────────────────────────────────────
 const rb=document.getElementById('rawBars');
-for(let i=0;i<18;i++) rb.innerHTML+=`<div class="bw"><div class="b" id="rb${i}" style="background:${CH_COL[i]};height:0%"></div><div class="bl">${CH_LBL[i]}</div></div>`;
+for(let i=0;i<18;i++) rb.innerHTML+=`<div class="bw"><div class="rawb" id="rb${i}" style="background:${CH_COL[i]};height:0%"></div><div class="bl">${CH_LBL[i]}</div></div>`;
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+const tlogCard=document.getElementById('tlog').closest('.card');
+const rightCol=document.querySelector('.rcol');
+if(tlogCard && rightCol) rightCol.appendChild(tlogCard);
+resetTuning();
 applyTarget();
+renderAlgNarrative();
 doPoll();
 setInterval(()=>{if(!poll)doPoll();},3000);
 </script>
@@ -1028,10 +1475,12 @@ setInterval(()=>{if(!poll)doPoll();},3000);
 
 // ── Web handlers ──────────────────────────────────────────────────────────────
 int runAutoGain(); // defined in Setup section below
-void handleRoot(){ server.send(200,"text/html",HTML); }
+void handleRoot(AsyncWebServerRequest* request){ request->send(200,"text/html",HTML); }
 
-void handleStatus(){
+static String buildStatusJson(){
+  uint32_t elapsedMs = runStartMs > 0 ? (millis() - runStartMs) : 0;
   String j="{";
+  j.reserve(384);
   j+="\"running\":"+String(running?"true":"false")+",";
   j+="\"lastScore\":"+String(lastScore,1)+",";
   j+="\"sensor\":"+String(sensorOK?"true":"false")+",";
@@ -1045,104 +1494,187 @@ void handleStatus(){
   j+="\"bestR\":"+String(bestR)+",\"bestG\":"+String(bestG)+",\"bestB\":"+String(bestB)+",";
   j+="\"bestScore\":"+String(bestScore,1)+",";
   j+="\"iter\":"+String(totalIter)+",";
+  j+="\"evals\":"+String(evalCount)+",";
+  j+="\"elapsedMs\":"+String(elapsedMs)+",";
+  j+="\"hit90Ms\":"+String(hit90Ms)+",";
   j+="\"converged\":"+String(converged?"true":"false")+",";
   j+="\"msg\":\""+jsonEscape(stateMsg)+"\"";
   j+="}}";
-  server.send(200,"application/json",j);
+  return j;
 }
 
-void handleStart(){
+void handleStart(AsyncWebServerRequest* request){
   if(!sensorOK){
-    server.send(503,"application/json","{\"error\":\"sensor unavailable\"}");
+    request->send(503,"application/json","{\"error\":\"sensor unavailable\"}");
     return;
   }
-  String body=server.arg("plain");
   String algStr;
   uint8_t reqR=0, reqG=0, reqB=0;
-  if(!parseJsonString(body,"algorithm",algStr)){
-    server.send(400,"application/json","{\"error\":\"missing algorithm\"}");
+  if(!getRequestString(request,"algorithm",algStr)){
+    request->send(400,"application/json","{\"error\":\"missing algorithm\"}");
     return;
   }
-  if(!parseRgbRequest(body,reqR,reqG,reqB)){
-    server.send(400,"application/json","{\"error\":\"invalid rgb\"}");
+  if(!getRequestRgb(request,reqR,reqG,reqB)){
+    request->send(400,"application/json","{\"error\":\"invalid rgb\"}");
     return;
   }
+  int reqSettle=0, reqPause=0, reqSpsaRestart=0, reqBoCand=0, reqTsCand=0, reqCmaMu=0;
+  float reqSpsaH=0, reqSpsaA=0, reqBoKappa=0, reqTsBw=0, reqCmaSig=0;
+  if(getRequestInt(request,"settle_ms",reqSettle)) settleMs = (uint32_t)constrain(reqSettle, 50, 1000);
+  if(getRequestInt(request,"pause_ms",reqPause)) pauseMs = (uint32_t)constrain(reqPause, 0, 500);
+  if(getRequestFloat(request,"spsa_h",reqSpsaH)) spsaInitH = constrain(reqSpsaH, 2.0f, 120.0f);
+  if(getRequestFloat(request,"spsa_a",reqSpsaA)) spsaInitA = constrain(reqSpsaA, 5.0f, 150.0f);
+  if(getRequestInt(request,"spsa_restart",reqSpsaRestart)) spsaRestartPatience = constrain(reqSpsaRestart, 5, 120);
+  if(getRequestFloat(request,"bo_kappa",reqBoKappa)) boKappaInit = constrain(reqBoKappa, 0.2f, 8.0f);
+  if(getRequestInt(request,"bo_candidates",reqBoCand)) boCandidateCount = constrain(reqBoCand, 16, 160);
+  if(getRequestFloat(request,"ts_bw",reqTsBw)) tsBwInit = constrain(reqTsBw, 0.05f, 0.8f);
+  if(getRequestInt(request,"ts_candidates",reqTsCand)) tsCandidateCount = constrain(reqTsCand, 16, 160);
+  if(getRequestFloat(request,"cma_sigma",reqCmaSig)) cmaSigmaInit = constrain(reqCmaSig, 4.0f, 96.0f);
+  if(getRequestInt(request,"cma_mu",reqCmaMu)) cmaMuActive = constrain(reqCmaMu, 1, CMA_LAM);
   recTgtR=reqR; recTgtG=reqG; recTgtB=reqB;
   resetAll();
+  runStartMs=millis();
   if     (algStr=="spsa")    { alg=ALG_SPSA;    }
   else if(algStr=="bayes")   { alg=ALG_BAYES;   }
   else if(algStr=="thompson"){ alg=ALG_THOMPSON; }
   else if(algStr=="cmaes")   { alg=ALG_CMAES;   }
-  else{ server.send(400,"application/json","{\"error\":\"unknown algorithm\"}"); return; }
+  else{ request->send(400,"application/json","{\"error\":\"unknown algorithm\"}"); return; }
   // Two-step calibration: (1) dark frame with LED off, (2) target color with LED on.
   // Subtracting the dark frame removes ambient light's spectral signature from scoring.
   genTargetSpectrum(recTgtR,recTgtG,recTgtB); // synthetic fallback if sensor fails
   calibPhase=1;
   setLED(0,0,0); // LED off for dark frame
   setStateMessage("Calibrating: reading dark frame...");
-  running=true; settling=true; nextMs=millis()+SETTLE_MS;
-  server.send(200,"application/json","{\"ok\":true}");
+  running=true; settling=true; nextMs=millis()+settleMs;
+  request->send(200,"application/json","{\"ok\":true}");
 }
 
-void handleStop(){
+void handleStop(AsyncWebServerRequest* request){
   alg=ALG_NONE;
   stopExperiment("Stopped by user.", true);
-  server.send(200,"application/json","{\"ok\":true}");
+  request->send(200,"application/json","{\"ok\":true}");
 }
 
-void handleCalibrate(){
+void handleCalibrate(AsyncWebServerRequest* request){
   if(!sensorOK){
-    server.send(503,"application/json","{\"error\":\"sensor unavailable\"}");
+    request->send(503,"application/json","{\"error\":\"sensor unavailable\"}");
     return;
   }
   int g=runAutoGain();
   // Map index to approximate multiplier for display
   const char* labels[]={"0.5","1","2","4","8","16","32","64","128","256","512"};
   char msg[60]; snprintf(msg,59,"{\"ok\":true,\"gainIdx\":%d,\"gainLabel\":\"%sX\"}",g,g<11?labels[g]:"?");
-  server.send(200,"application/json",msg);
+  request->send(200,"application/json",msg);
 }
 
-void handleLog(){
-  int total=min(logCount,50);
+static String buildLogJson(){
+  int total=min(logCount,16);
   int start=(logCount<=LOG_MAX)?max(0,logHead-total):(logHead-total+LOG_MAX)%LOG_MAX;
   String j="[";
+  j.reserve(1800);
   for(int i=0;i<total;i++){
     const Reading& rd=logBuf[(start+i)%LOG_MAX]; if(i>0)j+=",";
     j+="{\"r\":"+String(rd.r)+",\"g\":"+String(rd.g)+",\"b\":"+String(rd.b)+",\"ch\":[";
     for(int c=0;c<NUM_CH;c++){j+=String(rd.ch[c]);if(c<NUM_CH-1)j+=",";}
     j+="]}";
   }
-  j+="]"; server.send(200,"application/json",j);
+  j+="]";
+  return j;
 }
 
-void handleThoughts(){
-  int total=min(thCount,30);
+static String buildThoughtsJson(){
+  int total=min(thCount,20);
   int start=(thCount<=TH_MAX)?max(0,thHead-total):(thHead-total+TH_MAX)%TH_MAX;
   String j="[";
+  j.reserve(2400);
   for(int i=0;i<total;i++){
     const Thought& t=thBuf[(start+i)%TH_MAX]; if(i>0)j+=",";
     j+="{\"r\":"+String(t.r)+",\"g\":"+String(t.g)+",\"b\":"+String(t.b)+
        ",\"score\":"+String(t.score,1)+",\"improved\":"+String(t.improved?"true":"false")+
        ",\"msg\":\""+jsonEscape(t.msg)+"\"}";
   }
-  j+="]"; server.send(200,"application/json",j);
+  j+="]";
+  return j;
 }
 
-void handleScores(){
+static String buildScoresJson(){
   int total=min(scoreLen,SCORE_MAX);
   int start=(scoreLen<=SCORE_MAX)?max(0,scoreHead-total):(scoreHead-total+SCORE_MAX)%SCORE_MAX;
-  String j="[";
+  String j="{\"all\":[";
+  j.reserve(3200);
   for(int i=0;i<total;i++){
     j+=String(scoreHist[(start+i)%SCORE_MAX],1);
     if(i<total-1)j+=",";
   }
-  j+="]"; server.send(200,"application/json",j);
+  j+="],\"accepted\":[";
+  for(int i=0;i<total;i++){
+    float v=acceptedScoreHist[(start+i)%SCORE_MAX];
+    if(v < 0.0f) j+="null";
+    else j+=String(v,1);
+    if(i<total-1)j+=",";
+  }
+  j+="]}";
+  return j;
+}
+
+static String buildSnapshotJson(bool includeLog){
+  String j="{\"status\":";
+  j.reserve(includeLog ? 5600 : 3800);
+  j += buildStatusJson();
+  j += ",\"scores\":";
+  j += buildScoresJson();
+  j += ",\"thoughts\":";
+  j += buildThoughtsJson();
+  if(includeLog){
+    j += ",\"log\":";
+    j += buildLogJson();
+  }
+  j += "}";
+  return j;
+}
+
+static bool getRequestInt(AsyncWebServerRequest* request, const char* key, int& valueOut){
+  const AsyncWebParameter* p = request->getParam(key, true);
+  if(!p) p = request->getParam(key);
+  if(!p) return false;
+  valueOut = p->value().toInt();
+  return true;
+}
+
+static bool getRequestFloat(AsyncWebServerRequest* request, const char* key, float& valueOut){
+  const AsyncWebParameter* p = request->getParam(key, true);
+  if(!p) p = request->getParam(key);
+  if(!p) return false;
+  valueOut = p->value().toFloat();
+  return true;
+}
+
+static bool getRequestString(AsyncWebServerRequest* request, const char* key, String& valueOut){
+  const AsyncWebParameter* p = request->getParam(key, true);
+  if(!p) p = request->getParam(key);
+  if(!p) return false;
+  valueOut = p->value();
+  return true;
+}
+
+static bool getRequestRgb(AsyncWebServerRequest* request, uint8_t& r, uint8_t& g, uint8_t& b){
+  int ri=0, gi=0, bi=0;
+  if(!getRequestInt(request,"r",ri) || !getRequestInt(request,"g",gi) || !getRequestInt(request,"b",bi)) return false;
+  if(ri<0 || ri>255 || gi<0 || gi>255 || bi<0 || bi>255) return false;
+  r=(uint8_t)ri; g=(uint8_t)gi; b=(uint8_t)bi;
+  return true;
 }
 
 // ── Auto-gain ─────────────────────────────────────────────────────────────────
 // Flashes white, steps gain until brightest SPEC channel is 8k–40k (no saturation).
 // Returns the gain index that was selected.
 // Gain enum: 0=0.5x 1=1x 2=2x 3=4x 4=8x 5=16x 6=32x 7=64x 8=128x 9=256x 10=512x
+void handleStatus(AsyncWebServerRequest* request){ request->send(200,"application/json",buildStatusJson()); }
+void handleLog(AsyncWebServerRequest* request){ request->send(200,"application/json",buildLogJson()); }
+void handleThoughts(AsyncWebServerRequest* request){ request->send(200,"application/json",buildThoughtsJson()); }
+void handleScores(AsyncWebServerRequest* request){ request->send(200,"application/json",buildScoresJson()); }
+void handleSnapshot(AsyncWebServerRequest* request){ request->send(200,"application/json",buildSnapshotJson(request->hasParam("log"))); }
+
 static int currentGainIdx=4;
 int runAutoGain(){
   if(!sensorOK) return currentGainIdx;
@@ -1185,6 +1717,7 @@ void setup(){
   connectWiFi();
   server.on("/",         HTTP_GET,  handleRoot);
   server.on("/status",   HTTP_GET,  handleStatus);
+  server.on("/snapshot", HTTP_GET,  handleSnapshot);
   server.on("/log",      HTTP_GET,  handleLog);
   server.on("/thoughts", HTTP_GET,  handleThoughts);
   server.on("/scores",   HTTP_GET,  handleScores);
@@ -1196,7 +1729,6 @@ void setup(){
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
 void loop(){
-  server.handleClient();
   if(!running) return;
   if(!sensorOK){
     stopExperiment("Sensor unavailable. Search cannot run.", true);
@@ -1204,7 +1736,7 @@ void loop(){
   }
   uint32_t now=millis(); if(now<nextMs) return;
   if(!settling){
-    if(calibPhase!=0){ settling=true; nextMs=now+SETTLE_MS; return; } // wait for calibration
+    if(calibPhase!=0){ settling=true; nextMs=now+settleMs; return; } // wait for calibration
     switch(alg){
       case ALG_SPSA:     stepSPSA();    break;
       case ALG_BAYES:    stepBO();      break;
@@ -1212,7 +1744,7 @@ void loop(){
       case ALG_CMAES:    stepCMA();     break;
       default: break;
     }
-    settling=true; nextMs=now+SETTLE_MS;
+    settling=true; nextMs=now+settleMs;
   } else {
     uint16_t buf[NUM_CH]={};
     if(as7343.readAllChannels(buf)){
@@ -1225,7 +1757,7 @@ void loop(){
         char msg[100];
         snprintf(msg,sizeof(msg),"Calibrating: reading target rgb(%d,%d,%d)...",recTgtR,recTgtG,recTgtB);
         setStateMessage(msg);
-        settling=true; nextMs=now+SETTLE_MS;
+        settling=true; nextMs=now+settleMs;
         return;
       }
       if(calibPhase==2){
@@ -1236,7 +1768,7 @@ void loop(){
             as7343.setGain((as7343_gain_t)currentGainIdx);
             Serial.printf("Calib saturated, reducing gain to idx=%d\n",currentGainIdx);
             setStateMessage("Calibration saturated, reducing sensor gain...");
-            settling=true; nextMs=now+SETTLE_MS;
+            settling=true; nextMs=now+settleMs;
             return;
           }
           stopExperiment("Calibration saturated at minimum gain. Lower LED brightness or move the sensor back.", true);
@@ -1252,12 +1784,13 @@ void loop(){
           case ALG_CMAES:    initCMA();     break;
           default: break;
         }
-        settling=false; nextMs=now+PAUSE_MS;
+        settling=false; nextMs=now+pauseMs;
         return;
       }
       int idx=logHead%LOG_MAX;
       Reading& rd=logBuf[idx]; rd.r=ledR;rd.g=ledG;rd.b=ledB;
       memcpy(rd.ch,buf,sizeof(rd.ch)); logHead++; if(logCount<LOG_MAX)logCount++;
+      evalCount++;
       float sc=computeScore(buf);
       lastScore=sc;
       switch(alg){
@@ -1275,6 +1808,6 @@ void loop(){
         return;
       }
     }
-    settling=false; nextMs=now+PAUSE_MS;
+    settling=false; nextMs=now+pauseMs;
   }
 }
