@@ -1,7 +1,9 @@
 ![screenshot](screenshot.png)
 This is a minimal self-driving lab demonstration to "discover" color theory by doing an exploration/exploitation search of color space by driving a RGB LED and measuring it with a color sensor, which can be made for $40. Has an optional battery box at the bottom for a 200mah LiPo battery that the Feather can automatically recharge, making this a totally self-contained and portable SDL.
 
-Load code onto ESP32 with the Platormio extension in VSCode (change the port in the ini file to whatever your ESP32 shows up as). Codex or Claude Code extensions in VS Code will do this for you. If you haven't set your wifi details in the code, it will prompt you to enter them on the serial terminal (115200 baud) and then save them so you don't have to do it again. Once it's connected to your network, you should be able to open the UI in your web browser by just typing "sdl.local" in the URL bar
+Load code onto ESP32 with the Platormio extension in VSCode (change the port in the ini file to whatever your ESP32 shows up as). Codex or Claude Code extensions in VS Code will do this for you. If you haven't set your wifi details in the code, it will prompt you to enter them on the serial terminal (115200 baud) and then save them so you don't have to do it again. Once it's connected to your network, you should be able to open the UI in your web browser by just typing "sdl.local" in the URL bar. 
+
+If it can't find your network or you haven't given it your network details, after 30 seconds it will switch into AP mode and create its own Wifi network called "SDL" (no password). Just connect to that network with your phone or computer and open a browser and the web interface will just show up automagically.
 
 Alternatively, you can just load the file on the ESP32 using the Arduino IDE.
 
